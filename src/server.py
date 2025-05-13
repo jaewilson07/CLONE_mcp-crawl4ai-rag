@@ -1,4 +1,4 @@
-from src.service.supabase import get_supabase_client
+from src.service.domo import DomoClient
 
 from pydantic import BaseModel
 from mcp.server.fastmcp import FastMCP
@@ -35,7 +35,7 @@ class MCP_Response(BaseModel):
 class CrawlerMetadata(BaseModel):
     """Standardized metadata for documents stored in Supabase."""
     # Core metadata
-    chunk_index: int
+    chunk_index: Optional[int] = None  # Made optional
     url: str  # Original URL of the content unit (page, file, etc.)
     source_domain: str  # e.g., "example.com", "github.com"
     crawled_at: CustomDateTime # Timestamp of when crawling/chunking occurred
@@ -56,7 +56,7 @@ class CrawlerMetadata(BaseModel):
     # To allow for any other specific metadata not covered
     additional_info: Optional[Dict[str, Any]] = None
 
-    def to_supabase_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         """Returns a dictionary representation suitable for Supabase, excluding None values."""
         # Pydantic's model_dump handles datetime serialization to ISO format by default if the model field is datetime
         # and the target (like JSON) requires string. Supabase client might handle datetime objects directly.
@@ -68,9 +68,10 @@ class Crawl4AIContext:
     """Context for the Crawl4AI MCP server."""
     crawler: AsyncWebCrawler
     supabase_client: Client
+    domo_client: DomoClient
     
 @asynccontextmanager
-async def crawl4ai_lifespan(server: FastMCP, supabase_client) -> AsyncIterator[Crawl4AIContext]:
+async def crawl4ai_lifespan(server: FastMCP, supabase_client, domo_client) -> AsyncIterator[Crawl4AIContext]:
     """
     Manages the Crawl4AI client lifecycle.
     
@@ -94,10 +95,12 @@ async def crawl4ai_lifespan(server: FastMCP, supabase_client) -> AsyncIterator[C
     try:
 
         print(supabase_client.supabase_url, supabase_client.supabase_key)
+        print(domo_client.domo_base_url, domo_client.index_id)
        
         yield Crawl4AIContext(
             crawler=crawler,
-            supabase_client=supabase_client
+            supabase_client=supabase_client,
+            domo_client=domo_client
         )
     finally:
         # Clean up the crawler

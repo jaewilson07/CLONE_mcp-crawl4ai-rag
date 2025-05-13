@@ -1,7 +1,7 @@
 import datetime
 import traceback
 import os
-import requests
+import logging
 
 from . import mcp
 from src.server import MCP_Response, CrawlerMetadata
@@ -26,10 +26,13 @@ from src.service.crawl4ai import (
 from src.service.supabase import add_documents_to_supabase
 
 from src.utils.crawler import is_sitemap, is_txt, is_github_repository, parse_sitemap
-from src.utils.chunking import smart_chunk_markdown, extract_section_info
+from src.utils.chunking import smart_chunk_markdown, extract_section_info, enrich_chunks_with_metadata
 from src.utils.files import save_raw_content_to_export
 
 DEFAULT_LOCAL_SAVE_DIR = "EXPORT"
+
+default_logger = logging.getLogger("DomoClientLogger")
+default_logger.setLevel(logging.INFO)
 
 # --- Individual Crawling Tools ---
 
@@ -49,6 +52,7 @@ async def crawl_single_page(
     try:
         crawler = ctx.request_context.lifespan_context.crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
+        domo_client = ctx.request_context.lifespan_context.domo_client
         run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
         result = await crawler.arun(url=url, config=run_config)
 
@@ -66,30 +70,13 @@ async def crawl_single_page(
                 )
 
             chunks = smart_chunk_markdown(result.markdown)
-            urls_db, chunk_numbers, contents, metadatas = [], [], [], []
-
-            for i, chunk in enumerate(chunks):
-                urls_db.append(url)
-                chunk_numbers.append(i)
-                contents.append(chunk)
-                section_info = extract_section_info(chunk)
-                meta = CrawlerMetadata(
-                    chunk_index=i,
-                    url=url,
-                    source_domain=urlparse(url).netloc,
-                    crawled_at=datetime.datetime.now(datetime.timezone.utc),
-                    crawler_tool=tool_name,
-                    document_title=section_info.get("title"),
-                    document_description=section_info.get("description"),
-                    document_keywords=section_info.get("keywords"),
-                    content_headings=section_info.get("headings"),
-                    additional_info=(
-                        {"local_file_path": local_file_path}
-                        if local_file_path
-                        else None
-                    ),
-                )
-                metadatas.append(meta.to_supabase_dict())
+            urls_db, chunk_numbers, contents, metadatas = enrich_chunks_with_metadata(
+                chunks=chunks,
+                source_url=url,
+                tool_name=tool_name,
+                local_file_path=local_file_path,
+                file_name_from_url=Path(urlparse(url).path).name or urlparse(url).netloc,
+            )
 
             if contents:
                 url_to_full_document = {url: result.markdown}
@@ -100,6 +87,13 @@ async def crawl_single_page(
                     contents=contents,
                     metadatas=metadatas,
                     url_to_full_document=url_to_full_document,
+                )
+                domo_client.upsert_text_embedding(
+                    markdown=result.markdown,
+                    url=url,
+                    tool_name=tool_name,
+                    local_file_path=url_to_full_document,
+                    file_name_from_url=Path(urlparse(url).path).name or urlparse(url).netloc
                 )
 
             response_data = {
@@ -177,6 +171,7 @@ async def crawl_github_repo(
 
         # Process repository files
         supabase_client = ctx.request_context.lifespan_context.supabase_client
+        domo_client = ctx.request_context.lifespan_context.domo_client
         urls_db, chunk_numbers, contents, metadatas = [], [], [], []
         url_to_full_document = {}
 
@@ -216,7 +211,7 @@ async def crawl_github_repo(
                             "local_file_path": str(file_path),
                         },
                     )
-                    metadatas.append(meta.to_supabase_dict())
+                    metadatas.append(meta.to_dict())
 
                 # Store the full document content
                 url_to_full_document[str(file_path)] = content
@@ -231,6 +226,14 @@ async def crawl_github_repo(
                 metadatas=metadatas,
                 url_to_full_document=url_to_full_document,
             )
+            domo_client.upsert_text_embedding(
+                markdown=content,
+                url=str(file_path),
+                tool_name=tool_name,
+                local_file_path=url_to_full_document,
+                file_name_from_url=Path(urlparse(url).path).name or urlparse(url).netloc
+            )
+
 
         response_data = {
             "repo_url": repo_url,
@@ -285,6 +288,8 @@ async def crawl_text_file_tool(
     try:
         crawler = ctx.request_context.lifespan_context.crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
+        domo_client = ctx.request_context.lifespan_context.domo_client
+
 
         crawl_results = await crawl_markdown_file(crawler, url)
 
@@ -314,29 +319,13 @@ async def crawl_text_file_tool(
         file_name_from_url = Path(urlparse(source_url).path).name
         chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
 
-        urls_db, chunk_numbers, contents, metadatas = [], [], [], []
-        for i, chunk in enumerate(chunks):
-            urls_db.append(source_url)
-            chunk_numbers.append(i)
-            contents.append(chunk)
-            section_info = extract_section_info(chunk)
-            meta = CrawlerMetadata(
-                chunk_index=i,
-                url=source_url,
-                source_domain=urlparse(source_url).netloc,
-                crawled_at=datetime.datetime.now(datetime.timezone.utc),
-                crawler_tool=tool_name,
-                document_title=section_info.get("title") or file_name_from_url,
-                document_description=section_info.get("description"),
-                document_keywords=section_info.get("keywords"),
-                content_headings=section_info.get("headings"),
-                file_name=file_name_from_url,
-                file_path_in_source=urlparse(source_url).path,
-                additional_info=(
-                    {"local_file_path": local_file_path} if local_file_path else None
-                ),
-            )
-            metadatas.append(meta.to_supabase_dict())
+        urls_db, chunk_numbers, contents, metadatas = enrich_chunks_with_metadata(
+            chunks=chunks,
+            source_url=source_url,
+            tool_name=tool_name,
+            local_file_path=local_file_path,
+            file_name_from_url=file_name_from_url
+        )
 
         if contents:
             url_to_full_document = {source_url: md}
@@ -348,7 +337,13 @@ async def crawl_text_file_tool(
                 metadatas=metadatas,
                 url_to_full_document=url_to_full_document,
             )
-
+            domo_client.upsert_text_embedding(
+                markdown=md,
+                url=url,
+                tool_name=tool_name,
+                local_file_path=url_to_full_document,
+                file_name_from_url=Path(urlparse(url).path).name or urlparse(url).netloc
+            )
         response_data = {
             "url": url,
             "crawl_type": "text_file",
@@ -391,6 +386,7 @@ async def crawl_sitemap_tool(
     try:
         crawler = ctx.request_context.lifespan_context.crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
+        domo_client = ctx.request_context.lifespan_context.domo_client
 
         sitemap_urls = parse_sitemap(url)
         if not sitemap_urls:
@@ -463,7 +459,7 @@ async def crawl_sitemap_tool(
                         "local_file_path": saved_file_paths_map.get(source_url),
                     },
                 )
-                metadatas.append(meta.to_supabase_dict())
+                metadatas.append(meta.to_dict())
                 chunk_count += 1
 
         if contents:
@@ -476,6 +472,14 @@ async def crawl_sitemap_tool(
                 url_to_full_document=url_to_full_document,
                 batch_size=20,
             )
+            domo_client.upsert_text_embedding(
+                markdown=md,
+                url=url,
+                tool_name=tool_name,
+                local_file_path=url_to_full_document,
+                file_name_from_url=Path(urlparse(url).path).name or urlparse(url).netloc
+            )
+
 
         actual_saved_paths = [p for p in saved_file_paths_map.values() if p]
         response_data = {
@@ -527,6 +531,7 @@ async def crawl_recursive_webpages_tool(
     try:
         crawler = ctx.request_context.lifespan_context.crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
+        domo_client = ctx.request_context.lifespan_context.domo_client
 
         crawl_results = await crawl_recursive_internal_links(
             crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent
@@ -591,7 +596,7 @@ async def crawl_recursive_webpages_tool(
                         "local_file_path": saved_file_paths_map.get(source_url),
                     },
                 )
-                metadatas.append(meta.to_supabase_dict())
+                metadatas.append(meta.to_dict())
                 chunk_count += 1
 
         if contents:
@@ -603,6 +608,13 @@ async def crawl_recursive_webpages_tool(
                 metadatas=metadatas,
                 url_to_full_document=url_to_full_document,
                 batch_size=20,
+            )
+            domo_client.upsert_text_embedding(
+                markdown=md,
+                url=url,
+                tool_name=tool_name,
+                local_file_path=url_to_full_document,
+                file_name_from_url=Path(urlparse(url).path).name or urlparse(url).netloc
             )
 
         actual_saved_paths = [p for p in saved_file_paths_map.values() if p]
